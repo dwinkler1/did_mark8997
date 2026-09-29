@@ -1,0 +1,1255 @@
+---
+title: "Difference-in-Differences"
+subtitle: "The 2×2, staggered adoption, synthetic DiD, and common pitfalls"
+author: "Daniel Winkler"
+date: today
+format:
+  revealjs:
+    slide-number: true
+    embed-resources: true
+    html-math-method: katex
+    fig-width: 9
+    fig-height: 4.8
+    fig-align: center
+    code-overflow: wrap
+    code-line-numbers: false
+execute:
+  echo: false
+  warning: false
+  message: false
+params:
+  # Set to false for a learner version: planted effects from
+  # instructor_truth/ are then neither read nor shown.
+  show_truth: true
+---
+
+```{r}
+#| label: setup
+#| include: false
+# Render from did_teaching_data/: quarto render did_lecture_slides.qmd
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(fixest)
+  library(ggplot2)
+  library(did)
+  library(panelView)
+  library(WeightIt)
+  library(synthdid)
+  library(cobalt)
+  library(bacondecomp)
+})
+options(scipen = 6, knitr.kable.NA = "")
+theme_set(theme_minimal(base_size = 15))
+# Whole-week ticks for every plot with weeks on the x axis.
+week_axis <- scale_x_continuous(breaks = scales::breaks_width(2))
+
+data_dir <- "data"
+truth_dir <- "instructor_truth"
+show_truth <- isTRUE(params$show_truth)
+
+read_case <- function(case_id) {
+  read.csv(
+    file.path(data_dir, sprintf("case_%s.csv", case_id)),
+    stringsAsFactors = FALSE
+  )
+}
+
+read_truth <- function(case_id) {
+  read.csv(file.path(truth_dir, sprintf("case_%s_truth.csv", case_id)))
+}
+
+# Planted ATT over the treated cells; NA when rendered without truth.
+true_att <- function(case_id) {
+  if (!show_truth) {
+    return(NA_real_)
+  }
+  truth <- read_truth(case_id)
+  mean(truth$tau[truth$treated == 1])
+}
+
+fmt <- function(x, digits = 3) formatC(x, format = "f", digits = digits)
+
+# Estimate and standard error of one fixest coefficient.
+coef_se <- function(fit, term = "treated") {
+  unname(coeftable(fit)[term, c("Estimate", "Std. Error")])
+}
+
+estimate_table <- function(specification, estimate, standard_error, case_id) {
+  out <- data.frame(
+    Specification = specification,
+    Estimate = estimate,
+    `Std. error` = standard_error,
+    check.names = FALSE
+  )
+  if (show_truth) {
+    out$`Planted ATT` <- true_att(case_id)
+  }
+  knitr::kable(out, digits = 3)
+}
+
+first_adoption <- function(d) {
+  min(d$adoption_period[d$ever_treated == 1], na.rm = TRUE)
+}
+
+plot_means <- function(d, group_var, vlines, title, subtitle = NULL) {
+  means <- d |>
+    summarise(.by = c(period, {{ group_var }}), mean_outcome = mean(outcome))
+  ggplot(
+    means,
+    aes(
+      x = period,
+      y = mean_outcome,
+      color = {{ group_var }},
+      shape = {{ group_var }}
+    )
+  ) +
+    geom_vline(xintercept = vlines, linetype = "dashed", color = "grey40") +
+    geom_line() +
+    geom_point(size = 2) +
+    labs(
+      title = title,
+      subtitle = subtitle,
+      x = "Week",
+      y = "Mean log revenue",
+      color = NULL,
+      shape = NULL
+    ) +
+    week_axis +
+    theme(legend.position = "bottom")
+}
+
+# Calendar-period event study with the treated-group interaction.
+fit_event <- function(d, ref) {
+  feols(
+    as.formula(sprintf(
+      "outcome ~ i(period, ever_treated, ref = %d) | unit_id + period",
+      ref
+    )),
+    vcov = ~unit_id,
+    data = d
+  )
+}
+
+# Joint Wald p-value that all pre-period coefficients before `ref` are zero.
+pre_test_p <- function(fit, ref) {
+  leads <- paste(seq_len(ref - 1L), collapse = "|")
+  wald(fit, keep = sprintf("^period::(%s):", leads), print = FALSE)$p
+}
+
+# Event-study coefficients as a data frame, with the reference period at 0.
+event_df <- function(fit, ref) {
+  ct <- coeftable(fit)
+  out <- data.frame(
+    event_time = as.integer(sub(
+      "^[A-Za-z_]+::(-?[0-9]+).*$",
+      "\\1",
+      rownames(ct)
+    )),
+    estimate = unname(ct[, "Estimate"]),
+    se = unname(ct[, "Std. Error"])
+  )
+  bind_rows(out, data.frame(event_time = ref, estimate = 0, se = 0)) |>
+    arrange(event_time)
+}
+
+plot_event <- function(es, xlab, ref, truth = NULL) {
+  p <- ggplot(es, aes(x = event_time, y = estimate)) +
+    geom_hline(yintercept = 0, color = "grey50") +
+    geom_vline(xintercept = ref + 0.5, linetype = "dashed", color = "grey40")
+  if (!is.null(truth)) {
+    p <- p +
+      geom_line(
+        data = truth,
+        aes(x = event_time, y = estimate),
+        color = "firebrick",
+        linetype = "dotted",
+        linewidth = 1
+      )
+  }
+  p +
+    geom_pointrange(aes(ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se)) +
+    labs(x = xlab, y = "Estimate and 95% CI") +
+    week_axis
+}
+
+cs_data <- function(d) {
+  d |>
+    mutate(
+      id_num = as.integer(sub("^unit_", "", unit_id)),
+      cohort = if_else(is.na(adoption_period), 0, adoption_period)
+    )
+}
+
+fit_cs <- function(d, xformla = ~1, est_method = "dr",
+                   control_group = "nevertreated", ...) {
+  att_gt(
+    yname = "outcome",
+    tname = "period",
+    idname = "id_num",
+    gname = "cohort",
+    xformla = xformla,
+    data = cs_data(d),
+    est_method = est_method,
+    control_group = control_group,
+    bstrap = FALSE,
+    panel = TRUE,
+    print_details = FALSE,
+    ...
+  )
+}
+
+cs_agg <- function(cs_fit, type = "simple") {
+  aggte(cs_fit, type = type, bstrap = FALSE, cband = FALSE)
+}
+
+cs_event_df <- function(cs_dynamic) {
+  data.frame(
+    event_time = as.integer(cs_dynamic$egt),
+    estimate = unname(cs_dynamic$att.egt),
+    se = unname(cs_dynamic$se.egt)
+  )
+}
+
+fit_sdid <- function(d) {
+  panel <- panel.matrices(
+    d,
+    unit = "unit_id",
+    time = "period",
+    outcome = "outcome",
+    treatment = "treated"
+  )
+  fit <- synthdid_estimate(panel$Y, panel$N0, panel$T0)
+  list(
+    fit = fit,
+    panel = panel,
+    estimate = as.numeric(fit),
+    se = sqrt(vcov(fit, method = "jackknife"))[1, 1]
+  )
+}
+```
+
+## Roadmap {.smaller}
+
+| Case | What it teaches |
+|---|---|
+| 01 | The 2×2, TWFE, event study, placebo, Callaway–Sant'Anna, synthetic DiD |
+| 02 | Parallel trends within covariate groups; weighting |
+| 03 | Selection on a temporary dip before adoption |
+| 04–05 | Staggered adoption and the Goodman-Bacon decomposition |
+| 06 | Spillovers to control stores |
+| 07 | Effects that differ by an observed store characteristic |
+| 08 | Controlling for a mediator (optional) |
+
+# Case 01: the 2×2 benchmark
+
+## Case 01: loyalty offer in half the stores
+
+```{r}
+#| label: case01-data
+#| fig-height: 4.4
+d01 <- read_case("01")
+g01 <- first_adoption(d01)
+panelview(
+  outcome ~ treated,
+  data = d01,
+  index = c("unit_id", "period"),
+  pre.post = TRUE,
+  by.timing = TRUE,
+  axis.adjust = TRUE,
+  axis.lab = "time",
+  main = "Case 01: treatment status by store and week"
+)
+```
+
+## Look at the group means first
+
+```{r}
+#| label: case01-means
+#| fig-height: 4.4
+d01 |>
+  mutate(group = if_else(ever_treated == 1, "Treated", "Control")) |>
+  plot_means(group, g01, "Case 01: mean outcome by group", "Dashed line: launch in week 7")
+```
+
+## What DiD estimates
+
+Potential outcomes $Y_{it}(1)$ and $Y_{it}(0)$; treatment starts in week $g$.
+
+$$
+\text{ATT} = \mathbb{E}\big[\,Y_{it}(1) - Y_{it}(0) \mid \text{treated},\ t \ge g\,\big]
+$$
+
+For treated stores after launch, $Y_{it}(0)$ is never observed. DiD fills it in with the control group's change over the same weeks.
+
+In every case the outcome is log weekly revenue and standard errors are clustered by unit.`r if (show_truth) " Tables show the planted ATT, the true effect in the simulation." else ""`
+
+## What DiD assumes
+
+1. **Parallel trends**: without treatment, treated and control units would have changed by the same amount on average.
+2. **No anticipation**: before week $g$, treated units' outcomes equal $Y(0)$.
+3. **SUTVA** (stable unit treatment value assumption), here no interference: a control unit's outcome does not depend on who is treated.
+
+Parallel trends concerns changes over time; fixed effects absorb time-invariant (constant) differences.
+
+## The 2×2 by hand
+
+```{r}
+#| label: case01-2x2
+cell_means_01 <- d01 |>
+  mutate(
+    group = if_else(ever_treated == 1, "Treated", "Control"),
+    window = if_else(period >= g01, "Post", "Pre")
+  ) |>
+  summarise(.by = c(group, window), mean_outcome = mean(outcome))
+m01 <- function(grp, win) {
+  cell_means_01$mean_outcome[cell_means_01$group == grp & cell_means_01$window == win]
+}
+two_by_two_01 <- data.frame(
+  Group = c("Treated", "Control"),
+  Pre = c(m01("Treated", "Pre"), m01("Control", "Pre")),
+  Post = c(m01("Treated", "Post"), m01("Control", "Post"))
+) |>
+  mutate(Change = Post - Pre)
+did_by_hand_01 <- diff(rev(two_by_two_01$Change))
+knitr::kable(two_by_two_01, digits = 3)
+```
+
+$$
+\begin{aligned}
+\widehat{\text{DiD}} &= (\bar y_{T,\text{post}} - \bar y_{T,\text{pre}}) - (\bar y_{C,\text{post}} - \bar y_{C,\text{pre}}) \\
+&= (`r fmt(m01("Treated", "Post"))` - `r fmt(m01("Treated", "Pre"))`) - (`r fmt(m01("Control", "Post"))` - `r fmt(m01("Control", "Pre"))`) \\
+&= `r fmt(m01("Treated", "Post") - m01("Treated", "Pre"))` - `r fmt(m01("Control", "Post") - m01("Control", "Pre"))` \\
+&= `r fmt(did_by_hand_01)`
+\end{aligned}
+$$
+
+## The same number from a regression
+
+$$
+y_{it} = \alpha_i + \lambda_t + \beta\, D_{it} + \varepsilon_{it}
+$$
+
+$D_{it} = \text{Treated}_i \times \text{Post}_t$ is `treated`: 1 only for treated-group stores in weeks `r g01`–`r max(d01$period)`. It is not `ever_treated`, which $\alpha_i$ absorbs.
+
+```{r}
+#| label: case01-twfe
+#| echo: true
+twfe_fit_01 <- feols(outcome ~ treated | unit_id + period,
+                     vcov = ~unit_id, data = d01)
+```
+
+```{r}
+#| label: case01-twfe-compare
+twfe_01 <- coef_se(twfe_fit_01)
+```
+
+Two-way fixed effects (TWFE): $\hat\beta =$ `r fmt(twfe_01[1], 4)` (SE `r fmt(twfe_01[2], 4)`). The 2×2 by hand: `r fmt(did_by_hand_01, 4)`.
+
+With one adoption date and a balanced panel, TWFE *is* the 2×2.
+
+## Event study: inspect the pre-period
+
+$$
+y_{it} = \alpha_i + \lambda_t + \textstyle\sum_{k \ne `r g01 - 1`} \beta_k\, \mathbf{1}\{t = k\}\cdot \text{Treated}_i + \varepsilon_{it}
+$$
+
+```{r}
+#| label: case01-event
+#| fig-height: 3.4
+event_fit_01 <- fit_event(d01, g01 - 1L)
+pre_p_01 <- pre_test_p(event_fit_01, g01 - 1L)
+plot_event(event_df(event_fit_01, g01 - 1L), "Week (week 6 is the reference)", g01 - 1L)
+```
+
+Joint Wald test that weeks 1–5 are zero: p = `r fmt(pre_p_01)`.
+
+## Placebo: pretend treatment started earlier
+
+```{r}
+#| label: case01-placebo
+#| echo: true
+placebo_fit_01 <- feols(
+  outcome ~ placebo_treated | unit_id + period,
+  vcov = ~unit_id,
+  data = d01 |>
+    filter(period < g01) |>
+    mutate(
+      placebo_treated = as.integer(ever_treated == 1 & period >= g01 - 3L)
+    )
+)
+```
+
+```{r}
+#| label: case01-placebo-result
+placebo_01 <- coef_se(placebo_fit_01, "placebo_treated")
+```
+
+A fake week-4 launch, using pre-launch weeks only: `r fmt(placebo_01[1])` (SE `r fmt(placebo_01[2])`).
+
+The placebo and the event-study leads use the same pre-period comparison. Neither tests parallel trends after launch.
+
+## Two alternatives to TWFE
+
+**Callaway–Sant'Anna**: estimate $\text{ATT}(g,t)$ for each cohort $g$ and week $t$ from one clean 2×2 against never-treated units, measured from week $g-1$. Then average the $\text{ATT}(g,t)$ with weights you choose.
+
+**Synthetic DiD** (Arkhangelsky et al. 2021): reweight control units so their pre-launch path parallels the treated path, and reweight pre-launch weeks to resemble the post-launch weeks. Then run DiD on the weighted panel.
+
+$$
+\hat\tau = \arg\min_{\tau,\mu,\alpha,\beta} \textstyle\sum_{i,t} \big(y_{it} - \mu - \alpha_i - \beta_t - D_{it}\,\tau\big)^2\ \hat\omega_i\,\hat\lambda_t
+$$
+
+## Case 01: the estimators agree
+
+```{r}
+#| label: case01-compare
+cs_fit_01 <- fit_cs(d01)
+cs_01 <- cs_agg(cs_fit_01)
+sdid_01 <- fit_sdid(d01)
+estimate_table(
+  c("TWFE", "Callaway–Sant'Anna", "Synthetic DiD"),
+  c(twfe_01[1], cs_01$overall.att, sdid_01$estimate),
+  c(twfe_01[2], cs_01$overall.se, sdid_01$se),
+  "01"
+)
+```
+
+In a clean design the alternatives add little. Each later case changes one thing about this design.
+
+## Case 01: synthetic DiD's fit
+
+```{r}
+#| label: sdid-01
+#| fig-height: 4.4
+plot(sdid_01$fit, overlay = 1) +
+  labs(x = "Week", y = "Mean log revenue") +
+  week_axis
+```
+
+# Case 02: parallel trends within groups
+
+## Case 02: CRM adoption varies with growth segment
+
+```{r}
+#| label: case02-means
+#| fig-height: 4.2
+d02 <- read_case("02")
+g02 <- first_adoption(d02)
+# Color by segment, line type by treatment: each segment's treated and control
+# paths sit side by side.
+d02 |>
+  mutate(group = if_else(ever_treated == 1, "Treated", "Control")) |>
+  summarise(.by = c(period, growth_segment, group), mean_outcome = mean(outcome)) |>
+  ggplot(aes(
+    x = period,
+    y = mean_outcome,
+    color = growth_segment,
+    linetype = group,
+    shape = group,
+    group = interaction(growth_segment, group)
+  )) +
+  geom_vline(xintercept = g02, linetype = "dashed", color = "grey40") +
+  geom_line() +
+  geom_point(size = 2) +
+  labs(
+    title = "Case 02: means by treatment and growth segment",
+    x = "Week",
+    y = "Mean log revenue",
+    color = "Growth segment",
+    linetype = NULL,
+    shape = NULL
+  ) +
+  week_axis +
+  theme(legend.position = "bottom")
+```
+
+High-growth retailers adopt more often and grow faster anyway.
+
+## Case 02: adjust for the segment {.smaller}
+
+```{r}
+#| label: case02-estimates
+twfe_02 <- coef_se(feols(outcome ~ treated | unit_id + period, vcov = ~unit_id, data = d02))
+baseline_02 <- d02 |>
+  filter(period == min(period)) |>
+  distinct(unit_id, ever_treated, growth_segment)
+ipw_02 <- weightit(ever_treated ~ growth_segment, data = baseline_02, method = "glm", estimand = "ATT")
+d02_ipw <- d02 |>
+  left_join(baseline_02 |> mutate(ipw_weight = ipw_02$weights) |> select(unit_id, ipw_weight), by = "unit_id")
+ipw_twfe_02 <- coef_se(feols(outcome ~ treated | unit_id + period, weights = ~ipw_weight, vcov = ~unit_id, data = d02_ipw))
+cs_02 <- cs_agg(fit_cs(d02, xformla = ~growth_segment, est_method = "ipw"))
+sdid_02 <- fit_sdid(d02)
+estimate_table(
+  c(
+    "TWFE, no adjustment",
+    "TWFE weighted by inverse propensity (segment)",
+    "Callaway–Sant'Anna IPW (segment)",
+    "Synthetic DiD (no covariates)"
+  ),
+  c(twfe_02[1], ipw_twfe_02[1], cs_02$overall.att, sdid_02$estimate),
+  c(twfe_02[2], ipw_twfe_02[2], cs_02$overall.se, sdid_02$se),
+  "02"
+)
+```
+
+Inverse-propensity weighting (IPW) reweights controls to the treated segment mix. It assumes trends are parallel within segments and that every segment has both treated and control retailers.
+
+## Case 02: check what the weights do
+
+```{r}
+#| label: case02-balance
+#| fig-height: 3.6
+balance_02 <- bal.tab(ipw_02, un = TRUE, disp = "means")
+love.plot(ipw_02, thresholds = c(m = 0.1), title = NULL)
+```
+
+The effective sample size of the weighted controls is `r fmt(balance_02$Observations["Adjusted", "Control"], 1)` of `r balance_02$Observations["Unadjusted", "Control"]`: extreme weights mean a few controls carry the estimate.
+
+## Case 02: synthetic DiD's fit
+
+```{r}
+#| label: sdid-02
+#| fig-height: 4.4
+plot(sdid_02$fit, overlay = 1) +
+  labs(x = "Week", y = "Mean log revenue") +
+  week_axis
+```
+
+## Case 02: where synthetic DiD puts its weight
+
+```{r}
+#| label: sdid-02-weights
+omega_02 <- attr(sdid_02$fit, "weights")$omega
+controls_02 <- data.frame(
+  unit_id = rownames(sdid_02$panel$Y)[seq_len(sdid_02$panel$N0)],
+  omega = omega_02
+) |>
+  left_join(baseline_02, by = "unit_id")
+treated_mix_02 <- baseline_02 |>
+  filter(ever_treated == 1) |>
+  count(growth_segment) |>
+  mutate(share = n / sum(n))
+controls_02 |>
+  summarise(.by = growth_segment, `Unweighted control share` = n() / nrow(controls_02), `Synthetic DiD weight` = sum(omega)) |>
+  left_join(treated_mix_02 |> select(growth_segment, `Treated share` = share), by = "growth_segment") |>
+  arrange(growth_segment) |>
+  rename(Segment = growth_segment) |>
+  knitr::kable(digits = 3)
+```
+
+Synthetic DiD never sees the segment. Matching pre-launch paths moves weight toward high-growth controls. Estimate `r fmt(sdid_02$estimate)` against unadjusted TWFE `r fmt(twfe_02[1])`.
+
+# Case 03: selection before adoption
+
+## Case 03: stores adopt after a sales slump
+
+```{r}
+#| label: case03-means
+#| fig-height: 4.4
+d03 <- read_case("03")
+g03 <- first_adoption(d03)
+d03 |>
+  mutate(group = if_else(ever_treated == 1, "Treated", "Control")) |>
+  plot_means(group, g03, "Case 03: mean outcome by group")
+```
+
+## Case 03: the dip shows in the event study
+
+```{r}
+#| label: case03-event
+#| fig-height: 4.2
+event_fit_03 <- fit_event(d03, g03 - 1L)
+pre_p_03 <- pre_test_p(event_fit_03, g03 - 1L)
+plot_event(event_df(event_fit_03, g03 - 1L), "Week (week 6 is the reference)", g03 - 1L)
+```
+
+Pre-test p = `r fmt(pre_p_03)`: adopting stores dip in weeks 5–6, then recover.
+
+## Case 03: which baseline? {.smaller}
+
+```{r}
+#| label: case03-estimates
+twfe_03 <- coef_se(feols(outcome ~ treated | unit_id + period, vcov = ~unit_id, data = d03))
+cs_03 <- cs_agg(fit_cs(d03))
+cs_dip_03 <- cs_agg(fit_cs(d03, anticipation = 2))
+sdid_03 <- fit_sdid(d03)
+estimate_table(
+  c("TWFE", "Synthetic DiD", "Callaway–Sant'Anna, base week 6", "Callaway–Sant'Anna, anticipation = 2 (base week 4)"),
+  c(twfe_03[1], sdid_03$estimate, cs_03$overall.att, cs_dip_03$overall.att),
+  c(twfe_03[2], sdid_03$se, cs_03$overall.se, cs_dip_03$overall.se),
+  "03"
+)
+```
+
+- TWFE and synthetic DiD average the dip into the baseline; the default Callaway–Sant'Anna baseline, week 6, is the bottom of the dip.
+- `anticipation = 2` moves the baseline to week 4. This assumes the slump would have reversed without the software, which the data cannot show.
+
+# Cases 04–05: staggered adoption
+
+## Cases 04 and 05: three cohorts plus never-treated
+
+```{r}
+#| label: stagger-data
+#| fig-height: 4.2
+d04 <- read_case("04")
+d05 <- read_case("05")
+panelview(
+  outcome ~ treated,
+  data = d05,
+  index = c("unit_id", "period"),
+  pre.post = TRUE,
+  by.timing = TRUE,
+  axis.adjust = TRUE,
+  axis.lab = "time",
+  main = "Case 05: treatment status by market and week"
+)
+```
+
+Both cases share the same adoption timing. The effect is constant in Case 04 and grows with exposure in Case 05.
+
+## Cohort means
+
+```{r}
+#| label: stagger-means
+#| fig-height: 4.4
+bind_rows(
+  d04 |> mutate(case = "Case 04: constant effect"),
+  d05 |> mutate(case = "Case 05: growing effect")
+) |>
+  mutate(cohort = if_else(is.na(adoption_period), "Never treated", paste("Adopts week", adoption_period))) |>
+  summarise(.by = c(case, period, cohort), mean_outcome = mean(outcome)) |>
+  ggplot(aes(x = period, y = mean_outcome, color = cohort)) +
+  geom_vline(xintercept = sort(unique(na.omit(d05$adoption_period))), linetype = "dashed", color = "grey60") +
+  geom_line() +
+  geom_point(size = 1.5) +
+  facet_wrap(~case) +
+  labs(x = "Week", y = "Mean log revenue", color = NULL) +
+  week_axis +
+  theme(legend.position = "bottom")
+```
+
+## TWFE breaks only when effects change over time {.smaller}
+
+```{r}
+#| label: stagger-table
+sunab_data <- function(d) d |> mutate(cohort = if_else(is.na(adoption_period), 10000, adoption_period))
+stagger_rows <- lapply(c("04", "05"), function(id) {
+  d <- read_case(id)
+  tw <- coef_se(feols(outcome ~ treated | unit_id + period, vcov = ~unit_id, data = d))
+  cs <- cs_agg(fit_cs(d))
+  sa <- summary(feols(outcome ~ sunab(cohort, period) | unit_id + period, vcov = ~unit_id, data = sunab_data(d)), agg = "ATT")
+  sa <- unname(coeftable(sa)["ATT", c("Estimate", "Std. Error")])
+  out <- data.frame(
+    Case = id,
+    Estimator = c("TWFE", "Callaway–Sant'Anna", "Sun–Abraham"),
+    Estimate = c(tw[1], cs$overall.att, sa[1]),
+    `Std. error` = c(tw[2], cs$overall.se, sa[2]),
+    check.names = FALSE
+  )
+  if (show_truth) out$`Planted ATT` <- true_att(id)
+  out
+})
+stagger_table <- do.call(rbind, stagger_rows)
+knitr::kable(stagger_table, digits = 3)
+```
+
+Parallel trends holds in both cases. The TWFE gap in Case 05 comes from the estimator.
+
+## Goodman-Bacon (2021): TWFE averages 2×2s {.smaller}
+
+| Comparison | Treated | Control | Window | Clean? |
+|---|---|---|---|---|
+| Treated vs never treated | cohort $k$ | never treated | all weeks | yes |
+| Earlier vs later | early cohort $k$ | late cohort $l$, not yet treated | before $l$ adopts | yes |
+| Later vs earlier | late cohort $l$ | early cohort $k$, **already treated** | after $k$ adopts | **no** |
+
+- The weights depend only on cohort sizes and timing. Cohorts treated for about half the panel get the most weight.
+- In "later vs earlier", an already-treated cohort is the control. If its effect is still changing, that change is subtracted.
+
+## A toy panel with a growing effect
+
+```{r}
+#| label: toy
+#| fig-height: 4
+toy <- expand.grid(unit = 1:20, period = 1:10) |>
+  mutate(
+    cohort = if_else(unit <= 10, 4, 8),
+    treated = as.integer(period >= cohort),
+    tau = if_else(treated == 1, 0.1 * (period - cohort + 1), 0),
+    outcome = 0.05 * period + tau
+  )
+toy_twfe <- coef(feols(outcome ~ treated | unit + period, vcov = ~unit, data = toy))[["treated"]]
+toy_att <- mean(toy$tau[toy$treated == 1])
+toy_mean <- function(g, periods) mean(toy$outcome[toy$cohort == g & toy$period %in% periods])
+toy_early_late <- (toy_mean(4, 4:7) - toy_mean(4, 1:3)) - (toy_mean(8, 4:7) - toy_mean(8, 1:3))
+toy_late_early <- (toy_mean(8, 8:10) - toy_mean(8, 4:7)) - (toy_mean(4, 8:10) - toy_mean(4, 4:7))
+toy |>
+  summarise(.by = c(period, cohort), outcome = mean(outcome)) |>
+  mutate(cohort = paste("Adopts week", cohort)) |>
+  ggplot(aes(x = period, y = outcome, color = cohort)) +
+  annotate("rect", xmin = 3.5, xmax = 10.5, ymin = -Inf, ymax = Inf, alpha = 0.08) +
+  geom_vline(xintercept = c(4, 8), linetype = "dashed", color = "grey40") +
+  geom_line() +
+  geom_point(size = 2) +
+  labs(x = "Week", y = "Outcome", color = NULL, caption = "Shaded: window of the later-vs-earlier comparison") +
+  week_axis +
+  theme(legend.position = "bottom")
+```
+
+The toy panel has no noise, a common trend, and an effect that rises by 0.1 each week after adoption.
+
+## The toy panel's 2×2s
+
+- True ATT: `r fmt(toy_att)`
+- Earlier vs later (weeks 1–7): `r fmt(toy_early_late)`
+- Later vs earlier (weeks 4–10): `r fmt(toy_late_early)`. The early cohort's rising effect is subtracted.
+- TWFE: `r fmt(toy_twfe)`, about `r round(100 * toy_twfe / toy_att)`% of the true ATT.
+
+## Decomposing Case 05
+
+```{r}
+#| label: bacon-functions
+# Goodman-Bacon decomposition from bacondecomp, with the comparison types
+# relabelled to match the table on the "TWFE averages 2×2s" slide.
+bacon_types <- c(
+  "Treated vs Untreated" = "Treated vs never treated",
+  "Earlier vs Later Treated" = "Earlier vs later",
+  "Later vs Earlier Treated" = "Later vs earlier (already treated)"
+)
+decompose <- function(d) {
+  out <- bacon(outcome ~ treated, data = d, id_var = "unit_id", time_var = "period", quietly = TRUE)
+  out$type <- unname(bacon_types[as.character(out$type)])
+  out
+}
+
+bacon_summary <- function(bd) {
+  bd |>
+    summarise(
+      .by = type,
+      `Number of 2×2s` = n(),
+      `Total weight` = sum(weight),
+      `Weighted mean 2×2` = sum(weight * estimate) / sum(weight)
+    ) |>
+    rename(Comparison = type)
+}
+```
+
+```{r}
+#| label: bacon-05
+bacon_05 <- decompose(d05)
+twfe_05 <- coef_se(feols(outcome ~ treated | unit_id + period, vcov = ~unit_id, data = d05))
+knitr::kable(bacon_summary(bacon_05), digits = 3)
+```
+
+From `bacondecomp::bacon()`. Identity check: $\sum_j s_j \hat\beta_j =$ `r fmt(sum(bacon_05$weight * bacon_05$estimate), 4)`; TWFE $\hat\beta =$ `r fmt(twfe_05[1], 4)`.
+
+## Every 2×2, by weight: Case 04 against Case 05
+
+```{r}
+#| label: bacon-plot
+#| fig-height: 4.2
+bacon_04 <- decompose(d04)
+twfe_04 <- coef_se(feols(outcome ~ treated | unit_id + period, vcov = ~unit_id, data = d04))
+bind_rows(
+  bacon_04 |> mutate(case = "Case 04: constant effect", twfe = twfe_04[1]),
+  bacon_05 |> mutate(case = "Case 05: growing effect", twfe = twfe_05[1])
+) |>
+  ggplot(aes(x = estimate, y = weight, color = type, shape = type)) +
+  geom_vline(aes(xintercept = twfe), linetype = "dashed", color = "grey40") +
+  geom_point(size = 3) +
+  facet_wrap(~case) +
+  labs(
+    x = "2×2 DiD estimate",
+    y = "Weight in TWFE",
+    color = NULL,
+    shape = NULL,
+    caption = "Dashed line: TWFE estimate"
+  ) +
+  theme(legend.position = "bottom", legend.direction = "vertical")
+```
+
+In Case 05 the later-vs-earlier comparisons turn negative: they subtract the early cohorts' growing effects.
+
+## Case 04 for contrast: same timing, constant effect
+
+```{r}
+#| label: bacon-04
+knitr::kable(bacon_summary(bacon_04), digits = 3)
+```
+
+The weights match Case 05's. With a constant effect, every 2×2 recovers it.
+
+## Case 05: choose the average {.smaller}
+
+```{r}
+#| label: cs-aggregations
+cs_fit_05 <- fit_cs(d05)
+cs_fit_05_nyt <- fit_cs(d05, control_group = "notyettreated")
+agg_types <- c(simple = "Simple: all treated cells", group = "By cohort, then averaged", dynamic = "By event time, then averaged", calendar = "By calendar week, then averaged")
+agg_rows <- lapply(names(agg_types), function(type) {
+  never <- cs_agg(cs_fit_05, type)
+  nyt <- cs_agg(cs_fit_05_nyt, type)
+  data.frame(
+    Aggregation = agg_types[[type]],
+    `Never-treated controls` = never$overall.att,
+    `Not-yet-treated controls` = nyt$overall.att,
+    check.names = FALSE
+  )
+})
+knitr::kable(do.call(rbind, agg_rows), digits = 3)
+```
+
+Each row answers a different question; pick the one that matches the estimand. Not-yet-treated controls add power but require no anticipation among later adopters.
+
+# Case 06: spillovers
+
+## Case 06: promotions spill over to nearby stores
+
+```{r}
+#| label: case06-means
+#| fig-height: 4.4
+d06 <- read_case("06")
+g06 <- first_adoption(d06)
+d06 <- d06 |>
+  mutate(exposure = case_when(
+    ever_treated == 1 ~ "Promoted store",
+    distance_to_treated == 1 ~ "Nearby untreated",
+    TRUE ~ "Distant untreated"
+  ))
+d06 |>
+  summarise(.by = c(period, exposure), mean_outcome = mean(outcome)) |>
+  mutate(.by = exposure, change = mean_outcome - mean(mean_outcome[period < g06])) |>
+  ggplot(aes(x = period, y = change, color = exposure, shape = exposure)) +
+  geom_vline(xintercept = g06, linetype = "dashed", color = "grey40") +
+  geom_line() +
+  geom_point(size = 2) +
+  labs(x = "Week", y = "Change from own pre-launch mean", color = NULL, shape = NULL) +
+  week_axis +
+  theme(legend.position = "bottom")
+```
+
+## Case 06: controls must be unexposed
+
+```{r}
+#| label: case06-table
+twfe_06 <- coef_se(feols(outcome ~ treated | unit_id + period, vcov = ~unit_id, data = d06))
+far_06 <- coef_se(feols(outcome ~ treated | unit_id + period, vcov = ~unit_id, data = filter(d06, ever_treated == 1 | distance_to_treated >= 5)))
+near_06 <- coef_se(feols(outcome ~ treated | unit_id + period, vcov = ~unit_id, data = filter(d06, ever_treated == 1 | distance_to_treated == 1)))
+estimate_table(
+  c("All untreated stores as controls", "Distant stores only", "Nearby stores only"),
+  c(twfe_06[1], far_06[1], near_06[1]),
+  c(twfe_06[2], far_06[2], near_06[2]),
+  "06"
+)
+```
+
+Nearby stores gain from the promotion too, so using them as controls removes part of the effect. Define exposure before choosing controls.
+
+# Case 07: effects that differ across stores
+
+## Case 07: does app ordering work better in urban stores?
+
+```{r}
+#| label: case07-means
+#| fig-height: 4.2
+d07 <- read_case("07")
+g07 <- first_adoption(d07)
+d07 <- d07 |>
+  mutate(
+    group = if_else(ever_treated == 1, "Treated", "Control"),
+    location = if_else(urban == 1, "Urban", "Rural"),
+    treated_urban = treated * urban,
+    ever_treated_urban = ever_treated * urban
+  )
+d07 |>
+  summarise(.by = c(period, location, group), mean_outcome = mean(outcome)) |>
+  ggplot(aes(
+    x = period,
+    y = mean_outcome,
+    color = location,
+    linetype = group,
+    shape = group,
+    group = interaction(location, group)
+  )) +
+  geom_vline(xintercept = g07, linetype = "dashed", color = "grey40") +
+  geom_line() +
+  geom_point(size = 2) +
+  labs(
+    title = "Case 07: means by treatment and location",
+    x = "Week",
+    y = "Mean log revenue",
+    color = "Location",
+    linetype = NULL,
+    shape = NULL
+  ) +
+  week_axis +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+#| label: case07-counts
+counts_07 <- d07 |>
+  distinct(unit_id, urban, ever_treated) |>
+  count(urban, ever_treated)
+n07 <- function(u, e) counts_07$n[counts_07$urban == u & counts_07$ever_treated == e]
+```
+
+Urban stores adopt more often (`r n07(1, 1)` of `r n07(1, 1) + n07(1, 0)`, against `r n07(0, 1)` of `r n07(0, 1) + n07(0, 0)` rural stores) and grow faster whether or not they adopt.
+
+## One DiD per location {.smaller}
+
+Target: the ATT within each location $m$, and their difference.
+
+$$
+\text{ATT}(m) = \mathbb{E}\big[\,Y_{it}(1) - Y_{it}(0) \mid \text{treated},\ \text{urban}_i = m,\ t \ge g\,\big]
+$$
+
+Assumption: parallel trends **within each location** $m$, not across locations:
+
+$$
+\mathbb{E}\big[\Delta Y_{it}(0) \mid \text{treated},\ \text{urban}_i = m\big] = \mathbb{E}\big[\Delta Y_{it}(0) \mid \text{control},\ \text{urban}_i = m\big]
+$$
+
+Urban stores may trend differently from rural stores. Each location's treated stores are compared only with that location's controls.
+
+```{r}
+#| label: case07-2x2
+changes_07 <- d07 |>
+  mutate(post = period >= g07) |>
+  summarise(.by = c(location, ever_treated), change = mean(outcome[post]) - mean(outcome[!post]))
+by_hand_07 <- changes_07 |>
+  summarise(
+    .by = location,
+    `Treated change` = change[ever_treated == 1],
+    `Control change` = change[ever_treated == 0]
+  ) |>
+  mutate(DiD = `Treated change` - `Control change`) |>
+  arrange(location) |>
+  rename(Location = location)
+did_rural_07 <- by_hand_07$DiD[by_hand_07$Location == "Rural"]
+did_urban_07 <- by_hand_07$DiD[by_hand_07$Location == "Urban"]
+knitr::kable(by_hand_07, digits = 3)
+```
+
+Urban minus rural: `r fmt(did_urban_07)` − `r fmt(did_rural_07)` = `r fmt(did_urban_07 - did_rural_07)`. This is the triple difference.
+
+## The same numbers from one regression {.smaller}
+
+$$
+y_{it} = \alpha_i + \lambda_{t,\,\text{urban}_i} + \beta\, D_{it} + \gamma\, D_{it}\cdot\text{urban}_i + \varepsilon_{it}
+$$
+
+```{r}
+#| label: case07-triple
+#| echo: true
+triple_fit_07 <- feols(
+  outcome ~ treated + treated_urban | unit_id + period^urban,
+  vcov = ~unit_id,
+  data = d07
+)
+```
+
+```{r}
+#| label: case07-triple-result
+beta_07 <- coef_se(triple_fit_07, "treated")
+gamma_07 <- coef_se(triple_fit_07, "treated_urban")
+```
+
+- `period^urban` gives each location its own week effects $\lambda_{t,\text{urban}}$: parallel trends are imposed within each location only.
+- $\hat\beta =$ `r fmt(beta_07[1])`: the rural DiD. $\hat\beta + \hat\gamma =$ `r fmt(beta_07[1] + gamma_07[1])`: the urban DiD.
+- $\hat\gamma =$ `r fmt(gamma_07[1])` (SE `r fmt(gamma_07[2])`): the difference between locations.
+
+## Same as one regression per location {.smaller}
+
+```{r}
+#| label: case07-split
+#| echo: true
+location_fit_07 <- feols(outcome ~ i(urban, treated) | unit_id + period^urban,
+                         vcov = ~unit_id, data = d07)
+separate_fits_07 <- feols(outcome ~ treated | unit_id + period,
+                          split = ~urban, vcov = ~unit_id, data = d07)
+```
+
+```{r}
+#| label: case07-split-table
+data.frame(
+  Location = c("Rural", "Urban"),
+  `Separate: estimate` = sapply(separate_fits_07, coef),
+  `SE` = sapply(separate_fits_07, se),
+  `Pooled: estimate` = unname(coef(location_fit_07)),
+  `SE ` = unname(se(location_fit_07)),
+  check.names = FALSE,
+  row.names = NULL
+) |>
+  knitr::kable(digits = c(0, 4, 5, 4, 5))
+```
+
+- Each store belongs to one location, and each location has its own week effects, so the pooled model shares nothing across locations. It reproduces each location's TWFE exactly, and $\hat\gamma$ is the difference of the two separate estimates.
+- The standard errors differ only through fixest's small-sample correction, which counts all stores in the pooled model.
+
+## Case 07: leave out location-by-week effects {.smaller}
+
+```{r}
+#| label: case07-table
+omit_fit_07 <- feols(outcome ~ treated + treated_urban | unit_id + period, vcov = ~unit_id, data = d07)
+twfe_07 <- coef_se(feols(outcome ~ treated | unit_id + period, vcov = ~unit_id, data = d07))
+urban_share_07 <- mean(d07$urban[d07$ever_treated == 1 & d07$period == 1])
+att_w_07 <- c(1 - urban_share_07, urban_share_07)
+att_triple_07 <- sum(att_w_07 * coef(location_fit_07))
+att_triple_se_07 <- sqrt(drop(t(att_w_07) %*% vcov(location_fit_07) %*% att_w_07))
+omit_beta_07 <- coef_se(omit_fit_07, "treated")
+omit_gamma_07 <- coef_se(omit_fit_07, "treated_urban")
+table_07 <- data.frame(
+  Quantity = c("Rural effect", "Urban minus rural", "ATT, all treated stores"),
+  `Location-by-week effects` = c(beta_07[1], gamma_07[1], att_triple_07),
+  SE = c(beta_07[2], gamma_07[2], att_triple_se_07),
+  `Common week effects` = c(omit_beta_07[1], omit_gamma_07[1], twfe_07[1]),
+  `SE ` = c(omit_beta_07[2], omit_gamma_07[2], twfe_07[2]),
+  check.names = FALSE
+)
+if (show_truth) {
+  truth_07 <- read_truth("07") |> filter(treated == 1)
+  planted_07 <- tapply(truth_07$tau, truth_07$urban, mean)
+  table_07$Planted <- c(planted_07[["0"]], planted_07[["1"]] - planted_07[["0"]], mean(truth_07$tau))
+}
+knitr::kable(table_07, digits = 3)
+```
+
+- With common week effects, the urban stores' own trend is counted as treatment effect: the moderation coefficient compares urban with rural **treated** stores only.
+- The last row pools both locations. Treated stores are mostly urban, so the pooled two-group TWFE inherits the urban trend too.
+
+## Case 07: check pre-trends within each location
+
+```{r}
+#| label: case07-event
+#| fig-height: 3.8
+event_formula_07 <- function(fe) {
+  as.formula(sprintf(
+    "outcome ~ i(period, ever_treated, ref = %d) + i(period, ever_treated_urban, ref = %d) | unit_id + %s",
+    g07 - 1L, g07 - 1L, fe
+  ))
+}
+event_fit_07 <- feols(event_formula_07("period^urban"), vcov = ~unit_id, data = d07)
+event_omit_07 <- feols(event_formula_07("period"), vcov = ~unit_id, data = d07)
+pre_p_07 <- function(fit) {
+  wald(fit, keep = sprintf("^period::(%s):ever_treated_urban$", paste(seq_len(g07 - 2L), collapse = "|")), print = FALSE)$p
+}
+urban_leads_07 <- function(fit, label) {
+  ct <- coeftable(fit)
+  keep <- grepl(":ever_treated_urban$", rownames(ct))
+  data.frame(
+    event_time = as.integer(sub("^period::(-?[0-9]+):.*$", "\\1", rownames(ct)[keep])),
+    estimate = unname(ct[keep, "Estimate"]),
+    se = unname(ct[keep, "Std. Error"])
+  ) |>
+    bind_rows(data.frame(event_time = g07 - 1L, estimate = 0, se = 0)) |>
+    mutate(specification = label)
+}
+bind_rows(
+  urban_leads_07(event_fit_07, "Location-by-week effects"),
+  urban_leads_07(event_omit_07, "Common week effects")
+) |>
+  ggplot(aes(x = event_time, y = estimate, color = specification)) +
+  geom_hline(yintercept = 0, color = "grey50") +
+  geom_vline(xintercept = g07 - 0.5, linetype = "dashed", color = "grey40") +
+  geom_pointrange(
+    aes(ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se),
+    position = position_dodge(width = 0.5),
+    size = 0.3
+  ) +
+  labs(x = "Week (week 6 is the reference)", y = "Urban minus rural, 95% CI", color = NULL) +
+  week_axis +
+  theme(legend.position = "bottom")
+```
+
+Joint test that the urban-minus-rural leads in weeks 1–5 are zero: p = `r fmt(pre_p_07(event_fit_07))` with location-by-week effects, p = `r fmt(pre_p_07(event_omit_07), 4)` with common week effects.
+
+## Reading a moderated DiD
+
+- $\gamma$ says the effect **differs** between urban and rural stores. It does not say that making a store urban would raise the effect: urban stores differ in many other ways.
+- The moderator must be fixed before treatment and observed for control stores too. A moderator that treatment can change, or that exists only for treated stores, breaks the within-location comparison.
+- Interaction terms need far more data than a main effect. A wide confidence interval on $\gamma$ is not evidence that the effect is the same everywhere.
+
+# What pre-tests can and cannot show
+
+## Pre-tests across the cases {.smaller}
+
+```{r}
+#| label: pretest-table
+pretest_cases <- data.frame(
+  case = c("01", "02", "03", "06", "08"),
+  issue = c(
+    "Clean benchmark", "Composition differences", "Pre-adoption dip",
+    "Spillovers", "Bad control"
+  )
+)
+pretest_rows <- lapply(seq_len(nrow(pretest_cases)), function(r) {
+  id <- pretest_cases$case[r]
+  d <- read_case(id)
+  g <- first_adoption(d)
+  out <- data.frame(
+    Case = id,
+    Issue = pretest_cases$issue[r],
+    `Pre-test p` = pre_test_p(fit_event(d, g - 1L), g - 1L),
+    `TWFE estimate` = coef(feols(outcome ~ treated | unit_id + period, vcov = ~unit_id, data = d))[["treated"]],
+    check.names = FALSE
+  )
+  if (show_truth) out$`Planted ATT` <- true_att(id)
+  out
+})
+knitr::kable(do.call(rbind, pretest_rows), digits = 3)
+```
+
+A rejection signals a problem, but a pass does not rule one out: spillovers (06) and bad controls (08) leave the pre-period untouched.
+
+## Pre-tests have low power
+
+```{r}
+#| label: pretest-power
+power_rows <- lapply(c(0, 0.005, 0.01, 0.015, 0.02), function(slope) {
+  d <- d01 |> mutate(outcome = outcome + slope * period * ever_treated)
+  data.frame(
+    `Added trend per week (treated)` = slope,
+    `Bias in TWFE` = coef(feols(outcome ~ treated | unit_id + period, vcov = ~unit_id, data = d))[["treated"]] - twfe_01[1],
+    `Pre-test p` = pre_test_p(fit_event(d, g01 - 1L), g01 - 1L),
+    check.names = FALSE
+  )
+})
+knitr::kable(do.call(rbind, power_rows), digits = 3)
+```
+
+Each row adds a linear trend to Case 01's treated stores. A trend that passes the pre-test can still shift the estimate noticeably.
+
+## After a pre-test
+
+- Reporting only designs that pass a pre-test biases the published estimates (Roth 2022).
+- Instead, bound how far the post-launch violation may exceed the pre-launch one and report how the estimate changes (Rambachan and Roth 2023, `HonestDiD`).
+
+## Parallel trends depend on the outcome scale {.smaller}
+
+Control stores go from 100 to 110. Treated stores start at 200.
+
+| Assumption | Treated counterfactual |
+|---|---|
+| Parallel trends in **levels** | 210 (+5%) |
+| Parallel trends in **logs** | 220 (+10%) |
+
+Both can hold only if the groups start at the same level or nothing changes (Roth and Sant'Anna 2023).
+
+```{r}
+#| label: scale-levels
+levels_01 <- d01 |>
+  filter(period < g01) |>
+  summarise(.by = ever_treated, level = mean(exp(outcome)))
+```
+
+In Case 01, pre-launch revenue is `r fmt(levels_01$level[levels_01$ever_treated == 1], 2)` (treated) and `r fmt(levels_01$level[levels_01$ever_treated == 0], 2)` (control), so the scale matters little there.
+
+More on how the scale changes the estimand: [didestimands.app](https://didestimands.app).
+
+# Optional: Case 08
+
+## Case 08: advertising raises engagement
+
+```{r}
+#| label: case08-means
+#| fig-height: 4.2
+d08 <- read_case("08")
+g08 <- first_adoption(d08)
+d08_means <- d08 |>
+  mutate(group = if_else(ever_treated == 1, "Treated", "Control")) |>
+  summarise(.by = c(period, group), Outcome = mean(outcome), Engagement = mean(engagement))
+d08_means <- bind_rows(
+  transmute(d08_means, period, group, measure = "Outcome", value = Outcome),
+  transmute(d08_means, period, group, measure = "Engagement", value = Engagement)
+)
+d08_means |>
+  ggplot(aes(x = period, y = value, color = group, shape = group)) +
+  geom_vline(xintercept = g08, linetype = "dashed", color = "grey40") +
+  geom_line() +
+  geom_point(size = 2) +
+  facet_wrap(~measure, scales = "free_y") +
+  labs(x = "Week", y = "Mean", color = NULL, shape = NULL) +
+  week_axis +
+  theme(legend.position = "bottom")
+```
+
+## Case 08: controlling for a mediator
+
+```{r}
+#| label: case08-table
+total_08 <- coef_se(feols(outcome ~ treated | unit_id + period, vcov = ~unit_id, data = d08))
+bad_08 <- coef_se(feols(outcome ~ treated + engagement | unit_id + period, vcov = ~unit_id, data = d08))
+estimate_table(
+  c("TWFE without engagement", "TWFE controlling for engagement"),
+  c(total_08[1], bad_08[1]),
+  c(total_08[2], bad_08[2]),
+  "08"
+)
+```
+
+Controlling for engagement removes the effect that runs through it, leaving the direct effect`r if (show_truth) paste0(' (planted ', fmt(mean(read_truth("08")$direct_effect[read_truth("08")$treated == 1]), 2), ')') else ''`. Use only covariates measured before treatment.
+
+# Wrap-up
+
+## What each case needed {.smaller}
+
+::: {style="font-size: 85%"}
+```{r}
+#| label: summary
+summary_table <- data.frame(
+  Case = c("01", "02", "03", "04", "05", "06", "08", "07"),
+  Issue = c(
+    "Clean benchmark", "Composition differences", "Pre-adoption dip",
+    "Staggered, constant effect",
+    "Staggered, growing effect", "Spillovers", "Effect moderation",
+    "Bad control"
+  ),
+  `Naive TWFE` = c(
+    twfe_01[1], twfe_02[1], twfe_03[1],
+    stagger_table$Estimate[stagger_table$Case == "04" & stagger_table$Estimator == "TWFE"],
+    twfe_05[1], twfe_06[1], twfe_07[1], bad_08[1]
+  ),
+  Response = c(
+    "TWFE", "Callaway–Sant'Anna IPW", "Callaway–Sant'Anna, anticipation = 2",
+    "Callaway–Sant'Anna",
+    "Callaway–Sant'Anna", "Distant controls",
+    "Triple difference, location-by-week effects", "Drop the mediator"
+  ),
+  `Response estimate` = c(
+    twfe_01[1], cs_02$overall.att, cs_dip_03$overall.att,
+    stagger_table$Estimate[stagger_table$Case == "04" & stagger_table$Estimator == "Callaway–Sant'Anna"],
+    stagger_table$Estimate[stagger_table$Case == "05" & stagger_table$Estimator == "Callaway–Sant'Anna"],
+    far_06[1], att_triple_07, total_08[1]
+  ),
+  check.names = FALSE
+)
+if (show_truth) {
+  summary_table$`Planted ATT` <- vapply(summary_table$Case, true_att, numeric(1))
+}
+knitr::kable(summary_table, digits = 3, row.names = FALSE)
+```
+:::
+
+## Checklist before reporting a DiD
+
+1. Plot treatment timing and group means.
+2. State the estimand: which units, weeks, and average.
+3. Defend the comparison group: parallel trends, no anticipation, no spillovers.
+4. Adjust only for pre-treatment covariates; check overlap.
+5. With staggered timing, use Callaway–Sant'Anna or Sun–Abraham.
+6. Treat pre-tests as diagnostics; add a sensitivity analysis.
+7. Cluster at the level of treatment assignment.
+
+## References {.smaller}
+
+- Arkhangelsky, D., Athey, S., Hirshberg, D. A., Imbens, G. W., & Wager, S. (2021). Synthetic difference-in-differences. *American Economic Review*, 111(12), 4088–4118.
+- Callaway, B., & Sant'Anna, P. H. C. (2021). Difference-in-differences with multiple time periods. *Journal of Econometrics*, 225(2), 200–230.
+- de Chaisemartin, C., & D'Haultfœuille, X. (2020). Two-way fixed effects estimators with heterogeneous treatment effects. *American Economic Review*, 110(9), 2964–2996.
+- Goodman-Bacon, A. (2021). Difference-in-differences with variation in treatment timing. *Journal of Econometrics*, 225(2), 254–277.
+
+## References (continued) {.smaller}
+
+- Rambachan, A., & Roth, J. (2023). A more credible approach to parallel trends. *Review of Economic Studies*, 90(5), 2555–2591.
+- Roth, J. (2022). Pretest with caution: Event-study estimates after testing for parallel trends. *American Economic Review: Insights*, 4(3), 305–322.
+- Roth, J., & Sant'Anna, P. H. C. (2023). When is parallel trends sensitive to functional form? *Econometrica*, 91(2), 737–747.
+- Sun, L., & Abraham, S. (2021). Estimating dynamic treatment effects in event studies with heterogeneous treatment effects. *Journal of Econometrics*, 225(2), 175–199.
